@@ -1,0 +1,10 @@
+otto-zero-d/
+├─ pom.xml
+├─ README.md
+└─ src/
+   └─ main/
+      └─ java/
+         └─ com/
+            └─ example/
+               └─ otto/
+                  └─ OttoZeroD.java
