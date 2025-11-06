@@ -1,0 +1,203 @@
+
+---
+
+# Main Java source — `OttoZeroD.java`
+```java
+package com.example.otto;
+
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.text.DecimalFormat;
+import java.util.Locale;
+
+/**
+ * Zero-dimensional Otto-cycle thermal simulation
+ *
+ * Simplifications:
+ * - Single-zone gas per cylinder, constant cv, ideal gas
+ * - Volume law: V = Vc + Vd/2*(1 - cos(theta))
+ * - Gaussian heat release per cycle centered near TDC (theta = 0 rad here)
+ * - RK4 integrator
+ *
+ * Produces output.csv with columns:
+ * time[s], theta[rad], T[K], p[Pa], V[m3], P_shaft_total[W], Qdot_total[W]
+ *
+ * Author: example code for GitHub
+ */
+public class OttoZeroD {
+
+    public static void main(String[] args) throws IOException {
+        Locale.setDefault(Locale.US); // ensure decimal '.' in CSV
+
+        // --------------------------
+        // Simulation parameters
+        // --------------------------
+        final double P_TARGET = 50_000.0;   // Net shaft power required [W]
+        final double N_RPM = 3000.0;        // Engine speed [rpm]
+        final int N_CYL = 4;                // Number of cylinders
+        final double R_COMP = 9.0;          // Compression ratio (r = Vmax/Vmin)
+        final double GAMMA = 1.35;          // cp/cv
+        final double R_UNIV = 8.314462618;  // Universal gas constant [J/mol/K]
+        final double M_MOLAR = 0.02897;     // Molar mass of air [kg/mol]
+        final double T0 = 300.0;            // Initial gas temperature [K]
+        final double p0 = 101325.0;         // Initial pressure [Pa]
+        final double Vd = 5e-4;             // Displaced volume per cylinder [m3] (example)
+        final double Vc = Vd / (R_COMP - 1.0); // clearance volume (min volume)
+        final double ETA_MECH = 0.90;       // Mechanical efficiency (shaft losses)
+        final double QLOSS_FRAC = 0.15;     // Fraction of heat lost / other losses
+        final double COMB_DURATION_DEG = 10.0; // FWHM of combustion heat release in degrees (approx)
+        final double THETA_IGN_DEG = 0.0;   // ignition center (0 rad = TDC here)
+        final double ROD_RATIO = 3.0;       // not used in simple V law but kept for reference
+
+        // Derived physical constants
+        final double N_REVPS = N_RPM / 60.0;           // revolutions per second
+        final double CYCLES_PER_CYL_PER_S = N_REVPS / 2.0; // 4-stroke: one power stroke per 2 revs
+        final double R_SPECIFIC = R_UNIV / M_MOLAR;   // [J/kg/K]
+        final double cv = R_SPECIFIC / (GAMMA - 1.0);  // [J/(kg K)]
+        final double cp = GAMMA * cv;
+
+        // Mass per cylinder (approx) using ideal gas at max volume (Vmax = Vc + Vd)
+        final double Vmax = Vc + Vd;
+        final double m_charge = p0 * Vmax / (R_SPECIFIC * T0); // [kg]
+
+        // Required work / cycle / cylinder to meet P_TARGET
+        final double W_cycle_req = P_TARGET / (N_CYL * CYCLES_PER_CYL_PER_S * ETA_MECH); // [J per cycle per cyl]
+        // ideal Otto efficiency
+        final double eta_otto = 1.0 - Math.pow(R_COMP, -(GAMMA - 1.0));
+        // heat needed per cycle ignoring losses
+        final double Q_in_cycle = W_cycle_req / eta_otto;
+        // combustion heat per cycle including losses
+        final double Q_combust_cycle = Q_in_cycle / (1.0 - QLOSS_FRAC);
+
+        // Angular speed
+        final double omega = 2.0 * Math.PI * N_REVPS; // rad/s (engine crank rad/s)
+        // sigma (standard deviation) for Gaussian in radians
+        final double sigmaTheta = (COMB_DURATION_DEG / 2.355) * Math.PI / 180.0; // deg FWHM -> sigma
+
+        // amplitude A such that integral Qdot dt over one rev equals Q_combust_cycle
+        // integral over time = integral over theta of Q(theta)/omega; integral_theta Gaussian = sqrt(2*pi)*sigmaTheta
+        final double A_comb = Q_combust_cycle * omega / (Math.sqrt(2.0 * Math.PI) * sigmaTheta); // [W]
+
+        // Simulation control
+        final int cyclesToSim = 8;
+        final double tEnd = cyclesToSim / CYCLES_PER_CYL_PER_S; // seconds
+        final double dt = 1e-5; // time step [s] - small for stability; adjust as needed
+        final int steps = (int) Math.ceil(tEnd / dt);
+
+        System.out.println("Zero-D Otto simulation starting");
+        System.out.println(String.format("Target shaft power: %.0f W", P_TARGET));
+        System.out.println(String.format("rpm: %.0f rpm, cylinders: %d, cycles/s per cylinder: %.4f", N_RPM, N_CYL, CYCLES_PER_CYL_PER_S));
+        System.out.println(String.format("Compression ratio r=%.2f, eta_otto=%.4f", R_COMP, eta_otto));
+        System.out.println(String.format("Mass per cylinder m=%.6f kg, Vmax=%.6e m3, Vc=%.6e m3", m_charge, Vmax, Vc));
+        System.out.println(String.format("Required per-cycle work (per cyl): %.4f J", W_cycle_req));
+        System.out.println(String.format("Q_combust_cycle (per cyl): %.4f J", Q_combust_cycle));
+        System.out.println(String.format("Combustion amplitude A_comb = %.4e W, sigmaTheta=%.4e rad", A_comb, sigmaTheta));
+        System.out.println(String.format("Simulating %.1f s (~%d steps, dt=%.2e s)", tEnd, steps, dt));
+
+        // initial conditions
+        double T = T0;
+        double t = 0.0;
+
+        // Setup CSV output
+        BufferedWriter csv = new BufferedWriter(new FileWriter("output.csv"));
+        csv.write("time_s,theta_rad,T_K,p_Pa,V_m3,P_shaft_total_W,Qdot_total_W\n");
+
+        // Precompute some useful constants
+        final double Vd_over_2 = Vd / 2.0;
+        final double thetaIgnRad = THETA_IGN_DEG * Math.PI / 180.0;
+
+        // Simple helper functions (lambda-like via inlined methods)
+        // Volume law: V(theta) = Vc + Vd/2*(1 - cos(theta))
+        java.util.function.DoubleUnaryOperator volume = (theta) -> Vc + Vd_over_2 * (1.0 - Math.cos(theta));
+
+        // dV/dt = dV/dtheta * dtheta/dt ; dtheta/dt = omega
+        java.util.function.DoubleUnaryOperator dVdtheta = (theta) -> Vd_over_2 * Math.sin(theta);
+        // Gaussian heat release per cylinder Qdot(theta) [W]
+        java.util.function.DoubleUnaryOperator Qdot_theta = (theta) -> {
+            double arg = (theta - thetaIgnRad) / sigmaTheta;
+            return A_comb * Math.exp(-0.5 * arg * arg);
+        };
+
+        // For averaging
+        double cumulativeShaftEnergy = 0.0; // Joules integrated over simulation
+        double cumulativeTime = 0.0;
+        double lastCycleStartTime = 0.0;
+
+        // Warm-up: simulate and write CSV
+        for (int step = 0; step <= steps; step++) {
+            // theta as crank angle (let TDC be theta = 0 at each rev). Use t*N_revps*2*pi? earlier expressions:
+            // theta (rad) = omega * t  modulo 2*pi. We'll place ignition at 0 rad (TDC).
+            double theta = (omega * t) % (2.0 * Math.PI); // [0,2π)
+            // For numerical stability near 2π, keep as continuous angle as well: use thetaContinuous if needed.
+
+            // Evaluate instantaneous values for outputs and RK4 operations
+            // ODE: m*cv*dT/dt = Qdot(theta) - p*dV/dt
+            // p = m * R_specific * T / V
+
+            // RK4 for T
+            final double m = m_charge;
+            final double massCv = m * cv;
+
+            // helper to compute dT/dt given T and t
+            java.util.function.BiFunctionDoubleDouble dTdt = (TT, time) -> {
+                double thet = (omega * time) % (2.0 * Math.PI);
+                double Vnow = volume.applyAsDouble(thet);
+                double dVdTheta = dVdtheta.applyAsDouble(thet);
+                double dVdt = dVdTheta * omega;
+                double p = m * R_SPECIFIC * TT / Vnow;
+                double Qdot = Qdot_theta.applyAsDouble(thet); // per cylinder
+                // Energy eqn: m*cv*dT/dt = Qdot - p * dV/dt
+                return (Qdot - p * dVdt) / massCv;
+            };
+
+            // RK4 step for T over dt
+            double k1 = dTdt.apply(T, t);
+            double k2 = dTdt.apply(T + 0.5 * dt * k1, t + 0.5 * dt);
+            double k3 = dTdt.apply(T + 0.5 * dt * k2, t + 0.5 * dt);
+            double k4 = dTdt.apply(T + dt * k3, t + dt);
+            double Tnext = T + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4);
+
+            // compute instantaneous values at current time for output (use current T)
+            double Vnow = volume.applyAsDouble(theta);
+            double dVdtNow = dVdtheta.applyAsDouble(theta) * omega;
+            double pNow = m_charge * R_SPECIFIC * T / Vnow;
+            double QdotNow = Qdot_theta.applyAsDouble(theta); // per cylinder [W]
+            double P_gas_per_cyl = - pNow * dVdtNow; // instantaneous power transferred from gas to piston (W)
+            double P_shaft_total = ETA_MECH * P_gas_per_cyl * N_CYL;
+            double Qdot_total = QdotNow * N_CYL;
+
+            // Integrate shaft energy
+            cumulativeShaftEnergy += P_shaft_total * dt;
+            cumulativeTime += dt;
+
+            // Write CSV row occasionally - to keep file small write every e.g. 100 steps
+            if (step % 100 == 0) {
+                csv.write(String.format("%.6e,%.6e,%.6e,%.6e,%.6e,%.6e,%.6e\n",
+                        t, theta, T, pNow, Vnow, P_shaft_total, Qdot_total));
+            }
+
+            // advance
+            T = Tnext;
+            t += dt;
+        }
+
+        csv.close();
+
+        // Compute avg shaft power over simulation
+        double avgShaftPower = cumulativeShaftEnergy / cumulativeTime;
+
+        DecimalFormat df = new DecimalFormat("#,##0.00");
+        System.out.println("Simulation finished.");
+        System.out.println("Average shaft power (simulated) = " + df.format(avgShaftPower) + " W");
+        System.out.println("Requested target = " + df.format(P_TARGET) + " W");
+        System.out.println("Difference (sim - target) = " + df.format(avgShaftPower - P_TARGET) + " W");
+        System.out.println("Output file: output.csv");
+    }
+
+    // Small functional interface to allow bi-function with primitives without boxing
+    @FunctionalInterface
+    private interface BiFunctionDoubleDouble {
+        double apply(double a, double b);
+    }
+}
